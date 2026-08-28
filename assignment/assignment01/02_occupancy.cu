@@ -25,9 +25,9 @@
 __global__ void copy_kernel(const float* __restrict__ in,
                             float* __restrict__ out, long long n) {
     long long stride = (long long)gridDim.x * blockDim.x;
+#pragma unroll 1
     for (long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += stride) {
-#pragma unroll 1
         out[i] = in[i];
     }
 }

@@ -77,7 +77,9 @@ int main() {
         printf("%s  %8.3f ms   %8.1f Gop/s\n", names[k], ms[k],
                total / (ms[k] / 1e3) / 1e9);
     }
-    printf("\n吞吐比 x%.1f -- 对应硬件配比 128 FP32 lane : 16 SFU = 8:1\n",
+    // H100 实测约 6.3x 而非理想的 8x: 一侧是 FP32 kernel 打不满 128 lane 峰值,
+    // 另一侧 __sinf 循环体里的 FADD (a + c) 白嫖了空闲的 FP32 流水线, 不占 SFU
+    printf("\n吞吐比 x%.1f (H100 实测 ~6.3; 理想上限 8 = 128 FP32 lane : 16 SFU)\n",
            ms[1] / ms[0]);
 
     cudaFree(in);

@@ -1,52 +1,72 @@
-# Assignment 01：把硬件数字跑出来
+# Assignment 01
 
-配合 Lecture 1（GPU 体系结构）。四个实验分别验证正文的四个硬件概念——Coalescing、Occupancy 与 Latency Hiding、Bank Conflict、SFU 吞吐。每个实验是一个自包含的 `.cu` 文件：
+对应 lecture 1（GPU 体系结构）。四个小实验分别验证正文中的四个硬件概念，每个实验是一个自包含的 `.cu` 文件。
+
+## 环境
+
+- 任意一张 NVIDIA GPU（实验用通用特性，不依赖 Hopper 特有功能；趋势以 H100 为准）
+- CUDA Toolkit（`nvcc`）
+
+编译运行：
 
 ```bash
 nvcc -O3 -arch=native 01_coalescing.cu -o 01 && ./01
 ```
 
-实验只用到通用 CUDA 特性，不要求 H100：不同卡上绝对数字会不同，但趋势是一样的（下文预期现象以 H100 为参照）。
+（老版本 `nvcc` 若没有 `-arch=native`，换成本机算力，如 H100 用 `-arch=sm_90`。）
 
-## 任务
+## 实验 1：Coalescing 决定有效带宽（`01_coalescing.cu`）
 
-### 实验 1：Coalescing 决定有效带宽（`01_coalescing.cu`）
+对应正文：HBM3 / L2（128B cache line、32B sector）/ LSU 的 coalescing。
 
-复制同样 256MB 的数据，一个 kernel 让 warp 内 32 个线程访问连续地址，另一个让每个线程都跨过一个 128B cache line。
+复制同样大小的数据，一个 kernel 连续访存，另一个 stride=32 访存：
 
-- 跑两个 kernel，记录各自的有效带宽。
-- 思考：硬件实际搬的字节数差了多少倍？真正有用的字节差了多少倍？（对应 fig1.1 / fig1.2）
-- 选做：用 `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` 数出两个版本各取了多少 sector，验证你的推断。
+```cuda
+// 连续: warp 内 32 个线程地址连续, 合并成最少的 sector
+out[i] = in[i];
 
-预期：strided 版本有效带宽掉一个数量级左右（有用的字节只剩 1/32）。
+// strided: warp 内 32 个线程落在 32 个不同的 128B 缓存行上
+out[i] = in[(long long)i * 32 % n];
+```
 
-### 实验 2：Occupancy 与 Latency Hiding（`02_occupancy.cu`）
+预期：strided 版本有效带宽掉近一个数量级。sector 被取上来 32B 却只用 4B，就是 fig1.2 那张反面例子的实测版。
 
-总工作量固定，但 `#pragma unroll 1` 强制每个 warp 同一时刻只有一个 load 在飞，于是在飞请求数 ≈ 常驻 warp 数。程序会扫 1~32 blocks/SM 打印带宽曲线。
+H100 实测：coalesced 2345 GB/s vs strided 341 GB/s（约 6.9 倍）。
 
-- 找到带宽开始变平的拐点，对应多少 blocks/SM？
-- 用 Little's Law 粗算：拐点处 在飞请求数 × 每请求字节数 / 有效带宽 ≈ 内存延迟，是否落在几百 ns 量级？
+## 实验 2：Occupancy 与 Latency Hiding（`02_occupancy.cu`）
 
-预期：带宽先近似线性增长，饱和后变平——变平的拐点就是内存延迟被完全隐藏的位置。
+对应正文：Warp / Warp Scheduler / 延迟隐藏。
 
-### 实验 3：Shared Memory 的 Bank Conflict（`03_bank_conflict.cu`）
+固定总工作量的拷贝 kernel，`#pragma unroll 1` 强制每个 warp 同一时刻只允许一个 load 在飞（store 依赖 load 的结果）。此时在飞内存请求数 ≈ 常驻 warp 数。程序扫 1~32 blocks/SM：
 
-bank 编号 = 地址（float 下标）% 32，用 stride 控制冲突路数，读 shared memory 做累加。
+预期：有效带宽先随 blocks/SM 近似线性增长，到某个拐点后变平——拐点即延迟被完全隐藏的位置，也和 latency_hiding.gif 演示的状态对应。
 
-- 记录 stride = 1 / 2 / 4 / 8 / 16 / 32 的耗时比。
-- 思考：耗时比和冲突路数是什么关系？stride=32 时 LSU 实际发生了什么？
+H100 实测：620 → 1128 → 1888 → 2418 GB/s（1/2/4/8 blocks/SM），8 blocks/SM（约 50% occupancy）后进入平台，拐点非常清晰。
 
-预期：耗时基本按冲突路数线性上升，stride=32（32 路冲突）约为 stride=1 的几十倍。
+## 实验 3：Shared Memory 的 Bank Conflict（`03_bank_conflict.cu`）
 
-### 实验 4：SFU 的吞吐瓶颈（`04_sfu.cu`）
+对应正文：32 bank × 32bit（体育场大门）。
 
-两个 kernel 循环次数完全相同，唯一区别是循环体一条走 FP32 流水线（`fmaf`）、一条走 SFU（`__sinf`）。
+bank 编号 = 地址（float 下标）% 32。用不同 stride 读 shared memory 做累加：
 
-- 记录两者的吞吐比，和硬件配比 128 FP32 lane : 16 SFU 对一下。
-- 思考：为什么必须用 `__sinf` 而不能用 `sinf()`？（提示：把 `sinf()` 换进去跑一次，再想想 `sinf()` 的默认实现是什么。）
+- stride=1：一个 warp 正好打满 32 个 bank，无冲突
+- stride=32：32 个线程全部落在 bank 0，32 路冲突
 
-预期：吞吐比约 8:1。
+预期：耗时随 stride 增大线性恶化，stride=32 时约为无冲突的 32 倍量级（LSU 对 32 路冲突的重放）。
 
-## 提交
+H100 实测：x1.0 → x1.8 → x3.7 → x7.3 → x14.7 → x29.3，与冲突路数几乎完美线性。
 
-不需要交代码，把四个实验在你机器上的输出贴出来，并回答各实验下的思考问题即可。
+## 实验 4：SFU 的吞吐瓶颈（`04_sfu.cu`）
+
+对应正文：每 SM 只有 16 个 SFU vs 128 个 FP32 lane（8:1）。
+
+两个 kernel 循环次数完全相同，唯一区别是循环体：
+
+```cuda
+c = fmaf(a, b, c);    // 走 FP32 流水线
+c = __sinf(a + c);    // MUFU 指令, 走 SFU
+```
+
+预期：吞吐比接近 8:1。H100 实测约 6.3x——FP32 kernel 打不满 128 lane 的峰值，而 `__sinf` 循环体里的 FADD 白嫖了空闲的 FP32 流水线，所以比值略低于理想上限。方向不变：SFU 的吞吐确实只有 FP32 的几分之一。
+
+> 注意必须用 `__sinf` intrinsic：普通的 `sinf()` 默认会被编译成软件多项式（一堆 FMA），那样测的还是 FP32 流水线，根本碰不到 SFU。
